@@ -1,0 +1,63 @@
+#!/usr/bin/env python3
+import signal
+import time
+import argparse
+import sys
+import pawprints_control
+import pawprints_data
+from threading import Thread
+from queue import Queue
+
+COMMAND_SLEEP_GAP = 2 # seconds
+SOCKET_TIMEOUT = 3 # seconds
+
+def sig_handler(signum, frame):
+    print(signum)
+
+    with open("./pawprints_orchestrator.log", "a") as f:
+        f.write("In sig handler:" + str(signum) + "\n")
+
+    pawprints_control.sendToAndroid("stop")
+    print("Stopping the companion data process.")
+    pawprints_data.sig_handler(signum, frame)
+    #sys.exit()
+
+signal.signal(signal.SIGINT, sig_handler)    
+signal.signal(signal.SIGTERM, sig_handler)
+signal.signal(signal.SIGHUP, sig_handler)
+signal.signal(signal.SIGQUIT, sig_handler)
+
+def main():
+    parser = argparse.ArgumentParser(description='This is the PawPrints companion script, meant to be run on a compute node connected to PawPrints via USB. This script receives measurements from PawPrints Phone App, over ADB and saves locally as JSON files. Different JSON files are created for cellular and motions logs. Optionally, measurements can also be sent to a Kafka broker, to be analyzed and visualized by remote control or monitoring centers. ')
+    parser.add_argument('-p', '--logprefix', type=str, help='Optional. Prefix of the log file. prefix_cellular.jsonl and prefix_motion.jsonl logs will be generated. By default, the measurement campaign name, as specified in the measurement stream received from the phone, will be used as the prefix.')
+    parser.add_argument('-d', '--logdir', type=str, default="./Logs", help="Optional. Path of the logs directory. Directory will be created if it doesn't exist. By default, logs will be saved under ./Logs.")
+    parser.add_argument('-k', '--kafka', action='store_true', help="Optional. Enable publishing measurements to Kafka.")
+    parser.add_argument('-t', '--timeout', type=float, default=SOCKET_TIMEOUT, help="Optional. Socket timeout, when waiting for connections from the phone. Default value is 3 seconds")
+
+    options = parser.parse_args()
+    print("Options: ")
+    print("Publish to Kafka: {}".format(options.kafka))
+    print("Log prefix: {}".format(options.logprefix))
+    print("Logs directory: {}".format(options.logdir))
+    print("Socket timeout: {}".format(options.timeout))
+    print("-----------")
+
+    pawprints_control.sendToAndroid("stop")
+    time.sleep(COMMAND_SLEEP_GAP)
+    msg_queue = Queue()
+    if options.kafka:
+        print("Starting Kafka publisher ...")
+        import kafka_publish
+        t_kafka = Thread(target=kafka_publish.publish_loop, args=(msg_queue,))
+        t_kafka.start()
+
+    print("Starting the companion data process to receive measurements ...")
+    t_from_phone = Thread(target=pawprints_data.recv_stream_from_phone, args=(options, msg_queue,))
+    t_from_phone.start()
+    time.sleep(COMMAND_SLEEP_GAP)
+    pawprints_control.sendToAndroid("start")
+
+    t_from_phone.join()
+    
+if __name__ == "__main__":
+    main()
